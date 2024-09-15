@@ -1,5 +1,4 @@
-﻿using AccpacCOMAPI;
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using Wrapper.Models.Accpac.APModels.ApInvoiceBatchModels;
 using Wrapper.Models.Common;
 using Wrapper.Models.Common.Exceptions;
@@ -14,26 +13,29 @@ namespace Wrapper.Accpac.APModule.APInvoiceBatchServices
     public class APInvoiceBatchEditor : IAPInvoiceBatchEditor
     {
         private readonly ILogger<APInvoiceBatchEditor> logger;
-        private readonly IAPInvoiceBatchValidator aPInvoiceBatchValidator;
+        private readonly IAPInvoiceBatchValidator apInvoiceBatchValidator;
         private readonly IApInvoiceBatchViewComposer viewComposer;
         private readonly INotificationMessenger messenger;
+        private readonly IAPInvoiceBatchAccpacProcessor apInvoiceBatchAccpacProcessor;
 
         public APInvoiceBatchEditor(
                 ILogger<APInvoiceBatchEditor> logger,
-                IAPInvoiceBatchValidator aPInvoiceBatchValidator,
+                IAPInvoiceBatchValidator apInvoiceBatchValidator,
                 IApInvoiceBatchViewComposer viewComposer,
-                INotificationMessenger messenger
+                INotificationMessenger messenger,
+                IAPInvoiceBatchAccpacProcessor apInvoiceBatchAccpacProcessor
             )
         {
             this.logger = logger;
-            this.aPInvoiceBatchValidator = aPInvoiceBatchValidator;
+            this.apInvoiceBatchValidator = apInvoiceBatchValidator;
             this.viewComposer = viewComposer;
             this.messenger = messenger;
+            this.apInvoiceBatchAccpacProcessor = apInvoiceBatchAccpacProcessor;
         }
 
         public async Task CreateBatchAsync(IOperationContext context, ApInvoiceBatchEntryModel model)
         {
-            await aPInvoiceBatchValidator.ValidateCreateInvoiceBatchAsync(context, model);
+            await apInvoiceBatchValidator.ValidateCreateInvoiceBatchAsync(context, model);
 
             int currentEntry = 0;
             int totalEntries = model.Headers.Count;
@@ -44,10 +46,7 @@ namespace Wrapper.Accpac.APModule.APInvoiceBatchServices
             {
                 ApInvoiceBatchView view = viewComposer.BuildBatchView(context);
 
-                view.BatchView.RecordCreate(tagViewRecordCreateEnum.VIEW_RECORD_CREATE_INSERT);
-                view.BatchView.Fields.FieldByName["BTCHDESC"].set_Value(model.BatchName);
-                view.BatchView.Fields.FieldByName["DATEBTCH"].set_Value(model.BatchDate);
-                view.BatchView.Update();
+                apInvoiceBatchAccpacProcessor.CreateBatch(context, view, model.BatchName, model.BatchDate);
 
                 foreach (ApInvoiceBatchHeaderEntryModel header in model.Headers)
                 {
@@ -58,62 +57,13 @@ namespace Wrapper.Accpac.APModule.APInvoiceBatchServices
                         currentEntry, totalEntries, ProgressType.Import, LongRunningProcessType.APinvoiceAccpacPosting, context.UserId
                     ));
 
-                    // create header
-                    // process commands required to make sure, tax calculation error is not shown
-                    view.HeaderView.RecordCreate(tagViewRecordCreateEnum.VIEW_RECORD_CREATE_NOINSERT);
-                    view.HeaderView.Fields.FieldByName["DATEINVC"].set_Value(header.InvoiceDate);
-                    view.HeaderView.Fields.FieldByName["TEXTTRX"].set_Value(header.TransactionType); // AP
-                    view.HeaderView.Fields.FieldByName["PROCESSCMD"].set_Value("7");
-                    view.HeaderView.Process();
-                    view.HeaderView.Fields.FieldByName["PROCESSCMD"].set_Value("4");
-                    view.HeaderView.Process();
-                    view.HeaderView.Fields.FieldByName["IDVEND"].set_Value(header.VendorId);
-                    view.HeaderView.Fields.FieldByName["PROCESSCMD"].set_Value("7");
-                    view.HeaderView.Process();
-                    view.HeaderView.Fields.FieldByName["IDINVC"].set_Value(header.InvoiceNo);
-                    view.HeaderView.Fields.FieldByName["INVCDESC"].set_Value(header.Description);
-
-                    // set gross total
-                    view.HeaderView.Fields.FieldByName["AMTGROSTOT"].set_Value(header.TotalAmount);
-
-                    view.HeaderView.Process();
-
-                    // header optional fields
-
-                    view.HeaderOptFieldView.RecordCreate(tagViewRecordCreateEnum.VIEW_RECORD_CREATE_NOINSERT);
-                    view.HeaderOptFieldView.Fields.FieldByName["OPTFIELD"].set_Value("CREDITCODE");
-                    view.HeaderOptFieldView.Fields.FieldByName["SWSET"].set_Value("1"); 
-                    view.HeaderOptFieldView.Fields.FieldByName["VALIFTEXT"].set_Value(header.CreditCode);
-                    view.HeaderOptFieldView.Insert();
-
-                    foreach (ApInvoiceBatchDetailEntryModel detail in header.Details)
-                    {
-                        view.DetailView.RecordCreate(tagViewRecordCreateEnum.VIEW_RECORD_CREATE_NOINSERT);
-                        view.DetailView.Fields.FieldByName["TEXTDESC"].set_Value(detail.Description);
-                        view.DetailView.Fields.FieldByName["IDGLACCT"].set_Value(detail.AccountId.Trim());
-
-                        view.DetailView.Fields.FieldByName["AMTDIST"].set_Value(detail.Amount);
-                        view.DetailView.Fields.FieldByName["AMTGLDIST"].set_Value(detail.Amount);
-                        view.DetailView.Fields.FieldByName["AMTDISTHC"].set_Value(detail.Amount);
-                        view.DetailView.Fields.FieldByName["DISTNETHC"].set_Value(detail.Amount);
-
-                        view.DetailView.Fields.FieldByName["RATETAX1"].set_Value(0);
-                        view.DetailView.Fields.FieldByName["RATETAX2"].set_Value(0);
-                        view.DetailView.Fields.FieldByName["AMTTOTTAX"].set_Value(0);
-
-                        view.DetailView.Insert();
-
-                        view.DetailView.RecordClear();
-                    }
-
-                    view.HeaderView.Fields.FieldByName["TAXCLASS1"].set_Value("3"); // no tax
-
-                    view.HeaderView.Insert();
-                    view.HeaderView.Update();
-                    view.HeaderView.RecordClear();
+                    apInvoiceBatchAccpacProcessor.CreateHeader(context, view, header);
+                    apInvoiceBatchAccpacProcessor.CreateHeaderOptionalField(context, view, header);
+                    apInvoiceBatchAccpacProcessor.AddLinesToHeader(context, view, header);
+                    apInvoiceBatchAccpacProcessor.InsertHeader(context, view);
                 }
 
-                view.BatchView.Update();
+                apInvoiceBatchAccpacProcessor.UpdateBatch(context, view);
 
                 context.AccpacDBLink.TransactionCommit(out p);
             }
